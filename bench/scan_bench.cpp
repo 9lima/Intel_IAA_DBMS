@@ -78,8 +78,35 @@ void benchmark_multithreaded(qpl_path_t execution_path, uint32_t source_size, in
     std::iota(std::begin(source), std::end(source), 0);
     source[3] = 48;  // Ensuring at least one occurrence of the value
 
-    uint32_t chunk_size = source_size / num_threads;
+    uint32_t chunk_size = (source_size + num_threads - 1) / num_threads;
     std::vector<std::future<double>> futures;
+
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    for (int i = 0; i < num_threads; ++i) {
+        
+        size_t actual_chunk_size = end_part - src_part;
+        uint8_t* src_part  = source.data() + i * chunk_size;
+        uint8_t* end_part  = std::min(source.data() + source.size(), src_part + chunk_size);
+        uint8_t* dest_part = destination.data() + i * chunk_size;
+        futures.push_back(std::async(std::launch::async, benchmark_scan, execution_path, src_part, dest_part, actual_chunk_size));
+    }
+
+    double total_execution_time = 0;
+    for (auto& f : futures) {
+        total_execution_time = std::max(total_execution_time, f.get());  
+    }
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    double actual_execution_time_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+    double throughput_mbps = (source_size / (actual_execution_time_ms / 1000.0)) / (1024 * 1024);
+
+    print_source_size(source_size);
+    std::cout << ", Threads: " << num_threads
+              << ", Execution Time: " << actual_execution_time_ms << " ms"
+              << ", Throughput: " << throughput_mbps << " MB/s\n";
+
+
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
@@ -103,6 +130,41 @@ void benchmark_multithreaded(qpl_path_t execution_path, uint32_t source_size, in
               << ", Execution Time: " << actual_execution_time_ms << " ms"
               << ", Throughput: " << throughput_mbps << " MB/s\n";
 }
+
+
+
+double linear_search(std::vector<uint8_t>* vec, int num_threads, size_t* count)
+{
+    auto start_time = std::chrono::high_resolution_clock::now();
+    for (size_t i = 0; i < (*vec).size(); ++i) {
+        if ((*vec)[i] == value_to_find) {
+            count++;
+        }
+    }
+    auto end_time = std::chrono::high_resolution_clock::now();
+
+    double actual_execution_time_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+    double throughput_mibps =
+        ((*vec).size() * sizeof(uint8_t) /
+            (actual_execution_time_ms / 1000.0)) /
+        (1024.0 * 1024.0);
+    
+    print_source_size(source_size);
+    std::cout << ", Threads: " << num_threads
+              << ", Execution Time: " << actual_execution_time_ms << " ms"
+              << ", Throughput: " << throughput_mbps << " MB/s\n";
+    
+    return actual_execution_time_ms;
+}
+
+
+
+
+
+
+
+
+
 
 int main(int argc, char** argv) {
     std::cout << "Intel(R) Query Processing Library version is " << qpl_get_library_version() << ".\n";
