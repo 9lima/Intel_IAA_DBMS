@@ -4,125 +4,142 @@
 #include <vector>
 #include <chrono>
 #include <thread>
+#include <bit>
+#include <bitset>
 #include <future>  
 #include "qpl/qpl.h"
 
 #include "utils.hpp" // For argument parsing
 
-constexpr const uint32_t input_bit_width     = 8;
-constexpr const uint32_t output_vector_width = 32;
-constexpr const uint32_t value_to_find       = 48;
-constexpr const uint32_t byte_bit_length     = 8;
+constexpr uint32_t input_bit_width     = 8;
+constexpr uint32_t value_to_find       = 48;
 
-void print_source_size(uint32_t size) {
-    if (size >= (1024 * 1024 * 1024)) {
-        std::cout << "Source Size: " << size / (1024 * 1024 * 1024) << " GB";
-    } else if (size >= (1024 * 1024)) {
-        std::cout << "Source Size: " << size / (1024 * 1024) << " MB";
-    } else if (size >= 1024) {
-        std::cout << "Source Size: " << size / 1024 << " KB";
-    } else {
-        std::cout << "Source Size: " << size << " Bytes";
-    }
-}
-
-double benchmark_scan(qpl_path_t execution_path, uint8_t* source, uint8_t* destination, uint32_t size) {
-    std::unique_ptr<uint8_t[]> job_buffer;
-    uint32_t                   job_size = 0;
+std::vector<uint8_t> benchmark_scan(qpl_path_t execution_path,
+                                    std::span<const uint8_t> src)
+{
+    uint32_t job_size = 0;
     qpl_status status = qpl_get_job_size(execution_path, &job_size);
-    if (status != QPL_STS_OK) {
-        std::cerr << "Error " << status << " while getting job size.\n";
-        return -1;
-    }
-
-    job_buffer   = std::make_unique<uint8_t[]>(job_size);
-    qpl_job* job = reinterpret_cast<qpl_job*>(job_buffer.get());
-
+    if (status != QPL_STS_OK)
+        throw std::runtime_error("qpl_get_job_size failed: " + std::to_string(status));
+    auto job_buffer = std::make_unique<uint8_t[]>(job_size);
+    auto* job = reinterpret_cast<qpl_job*>(job_buffer.get());
     status = qpl_init_job(execution_path, job);
-    if (status != QPL_STS_OK) {
-        std::cerr << "Error " << status << " while initializing job.\n";
-        return -1;
-    }
+    if (status != QPL_STS_OK)
+        throw std::runtime_error("qpl_init_job failed: " + std::to_string(status));
 
-    job->next_in_ptr        = source;
-    job->available_in       = size;
-    job->next_out_ptr       = destination;
-    job->available_out      = size;
+    std::vector<uint8_t> dst;
+    dst.resize((src.size() + 7) / 8);
+  
     job->op                 = qpl_op_scan_eq;
+    job->next_in_ptr        = const_cast<uint8_t*>(src.data());
+    job->available_in       = static_cast<uint32_t>(src.size());
     job->src1_bit_width     = input_bit_width;
-    job->num_input_elements = size;
+    job->num_input_elements = static_cast<uint32_t>(src.size());
+    job->next_out_ptr       = dst.data();
+    job->available_out      = static_cast<uint32_t>(dst.size());
     job->out_bit_width      = qpl_ow_nom;
     job->param_low          = value_to_find;
-    job->flags              = QPL_FLAG_OMIT_CHECKSUMS |
-                              QPL_FLAG_OMIT_AGGREGATES;
+    job->flags              = QPL_FLAG_OMIT_CHECKSUMS | QPL_FLAG_OMIT_AGGREGATES;
 
-    auto start_time = std::chrono::high_resolution_clock::now();
     status = qpl_execute_job(job);
-    auto end_time = std::chrono::high_resolution_clock::now();
-
-    if (status != QPL_STS_OK) {
-        std::cerr << "Error " << status << " during scan execution.\n";
-        return -1;
-    }
-
-    double execution_time_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
     qpl_fini_job(job);
+    if (status != QPL_STS_OK)
+        throw std::runtime_error("qpl_execute_job failed: " + std::to_string(status));
 
-    return execution_time_ms;
+    return dst;
 }
 
-void benchmark_multithreaded(qpl_path_t execution_path, uint32_t source_size, int num_threads) {
-    std::vector<uint8_t> source(source_size, 0);
-    std::vector<uint8_t> destination(source_size, 4);
+void benchmark_multithreaded(qpl_path_t execution_path, uint32_t source_size, size_t num_threads) {
+    if (source_size == 0 || num_threads == 0) return;          // added
 
-    std::iota(std::begin(source), std::end(source), 0);
-    source[3] = 48;  // Ensuring at least one occurrence of the value
+    std::vector<uint8_t> source;
+    insert_random(&source, source_size);
+    source.back() = value_to_find;
+    std::vector<uint8_t> destination;
+    destination.reserve((source_size + 7) / 8);
 
-    uint32_t chunk_size = source_size / num_threads;
-    std::vector<std::future<double>> futures;
+    const size_t chunk_size = (source_size + num_threads - 1) / num_threads;
+    std::span<const uint8_t> all{source};
+    std::vector<std::future<std::vector<uint8_t>>> futures;
+    std::vector<size_t> counts;
 
-    auto start_time = std::chrono::high_resolution_clock::now();
+    auto start_time = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < num_threads; ++i) {
+        const size_t s = std::min<size_t>(source_size, i * chunk_size);
+        const size_t e = std::min<size_t>(chunk_size, start + chunk_size);
+        if (count == 0) continue;                              // added
 
-    for (int i = 0; i < num_threads; ++i) {
-        uint8_t* src_part = source.data() + i * chunk_size;
-        uint8_t* dest_part = destination.data() + i * chunk_size;
-        futures.push_back(std::async(std::launch::async, benchmark_scan, execution_path, src_part, dest_part, chunk_size));
+        counts.push_back(e - s);
+        futures.push_back(std::async(std::launch::async, benchmark_scan,
+                                     execution_path, all.subspan(start, count)));
     }
 
-    double total_execution_time = 0;
-    for (auto& f : futures) {
-        total_execution_time = std::max(total_execution_time, f.get());  
+    size_t total_bits = 0;
+    for (size_t i = 0; i < futures.size(); ++i) {
+        auto bits = futures[i].get();
+        const size_t count = counts[i];
+        const size_t shift = total_bits % 8;
+
+        if (count % 8) bits.back() &= uint8_t((1u << (count % 8)) - 1);
+
+        if (shift == 0) {
+            destination.insert(destination.end(), bits.begin(), bits.end());
+        } else {
+            for (uint8_t b : bits) {
+                destination.back() |= uint8_t(b << shift);
+                destination.push_back(uint8_t(b >> (8 - shift)));
+            }
+        }
+        total_bits += count;
+        destination.resize((total_bits + 7) / 8);
     }
+    auto end_time = std::chrono::steady_clock::now();
 
-    auto end_time = std::chrono::high_resolution_clock::now();
-    double actual_execution_time_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-    double throughput_mbps = (source_size / (actual_execution_time_ms / 1000.0)) / (1024 * 1024);
+    std::chrono::duration<double, std::milli> elapsed_ms = end_time - start_time;
+    double seconds         = elapsed_ms.count() / 1000.0;
+    double throughput_mbps = (source_size / (1024.0 * 1024.0)) / seconds;
+    std::cout << "Threads: " << num_threads
+              << "  Time: " << elapsed_ms.count() << " ms"
+              << "  Throughput: " << throughput_mbps << " MB/s\n";
 
-    print_source_size(source_size);
-    std::cout << ", Threads: " << num_threads
-              << ", Execution Time: " << actual_execution_time_ms << " ms"
-              << ", Throughput: " << throughput_mbps << " MB/s\n";
+    
+    size_t total_ones = std::accumulate(destination.begin(), destination.end(), size_t{0},
+        [](size_t sum, uint8_t v) { return sum + std::popcount(v); });
+    
+    std::cout << "Matched Items: " << total_ones << "\n";
+
+
 }
+
+
+void insert_random(std::vector<uint8_t>* vec, size_t size, size_t low = 0, size_t high = 255) {
+    vec->resize(size);
+    std::mt19937 gen{ std::random_device{}() };
+    std::uniform_int_distribution<int> dist(low, high);
+    
+    for (auto& byte : *vec) {
+        byte = static_cast<uint8_t>(dist(gen));
+    }
+}
+
+
+
 
 int main(int argc, char** argv) {
     std::cout << "Intel(R) Query Processing Library version is " << qpl_get_library_version() << ".\n";
-
     qpl_path_t execution_path = qpl_path_software;
     if (parse_execution_path(argc, argv, &execution_path, 0) != 0) {
         return 1;
     }
 
-    std::vector<uint32_t> source_sizes = {128 * 1024 * 1024,
-                                          256 * 1024 * 1024, 512 * 1024 * 1024, 1 * 1024 * 1024 * 1024};
-
-    std::vector<int> thread = {1, 2, 4, 8, 16, 32, 64, 96, 128, 256, 384};
-    //std::vector<int> thread = {1, 2, 4}; 
-    for (uint32_t size : source_sizes) {
-        for (auto num_threads: thread) {
-            benchmark_multithreaded(execution_path, size, num_threads);
+    std::vector<uint32_t> source_sizes = {128 * 1024 * 1024, 256 * 1024 * 1024, 512 * 1024 * 1024, 1 * 1024 * 1024 * 1024};
+    std::vector<size_t> thread_counts = {1, 2, 4, 8, 16, 32, 64, 96, 128};
+    for (uint32_t source_size : source_sizes) {
+        for (size_t num_threads : thread_counts) {
+            benchmark_multithreaded(execution_path, source_size, num_threads);
         }
     }
 
+    
     return 0;
 }
-
