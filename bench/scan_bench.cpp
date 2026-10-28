@@ -83,7 +83,7 @@ void benchmark_multithreaded(qpl_path_t execution_path, uint32_t source_size, in
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
-    for (int i = 0; i < num_threads; ++i) {
+    for (int i = 0; i < num_threads; ++i) { 
         uint8_t* src_part = source.data() + i * chunk_size;
         uint8_t* dest_part = destination.data() + i * chunk_size;
         futures.push_back(std::async(std::launch::async, benchmark_scan, execution_path, src_part, dest_part, chunk_size));
